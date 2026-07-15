@@ -4,7 +4,7 @@ const std = @import("std");
 
 pub fn create_step(b: *std.Build, name: []const u8) *std.Build.Step {
     const step = b.step(name, "emit compile_commands.json");
-    step.makeFn = make;
+    step.makeFn = make_link;
     return step;
 }
 
@@ -76,6 +76,7 @@ fn format_fragment(b: *std.Build, fragment: []const u8, path: []const u8) ?[]con
     });
 }
 
+/// load cdb_map from $cdb_dir/cdb.raw
 fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap([]const u8), p_loaded: ?*bool) !void {
     if (p_loaded) |loaded| {
         if (loaded.*) return;
@@ -107,6 +108,7 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     }
 }
 
+/// save cdb_map to $cdb_dir/cdb.raw
 fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringHashMap([]const u8)) !void {
     const filename = CDB_RAW_FILENAME;
     const filename_tmp = filename ++ ".tmp";
@@ -132,18 +134,18 @@ fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringH
     try cdb_dir.rename(filename_tmp, filename);
 }
 
-/// test if $project_root/compile_commands.json exists
-fn access_cdb(b: *std.Build) bool {
-    b.build_root.handle.access(CDB_FILENAME, .{}) catch return false;
+/// test if $cdb_dir/compile_commands.json exists
+fn access_cdb_json(cdb_dir: *std.fs.Dir) bool {
+    cdb_dir.access(CDB_FILENAME, .{}) catch return false;
     return true;
 }
 
-/// save to $project_root/compile_commands.json
-fn save_cdb(b: *std.Build, cdb_map: *const std.StringHashMap([]const u8)) !void {
+/// save to $cdb_dir/compile_commands.json
+fn save_cdb_json(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringHashMap([]const u8)) !void {
     const filename = CDB_FILENAME;
     const filename_tmp = filename ++ ".tmp";
 
-    const file = try b.build_root.handle.createFile(filename_tmp, .{});
+    const file = try cdb_dir.createFile(filename_tmp, .{});
     defer file.close();
 
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
@@ -172,10 +174,10 @@ fn save_cdb(b: *std.Build, cdb_map: *const std.StringHashMap([]const u8)) !void 
     try writer.interface.flush();
 
     // atomic rename
-    try b.build_root.handle.rename(filename_tmp, filename);
+    try cdb_dir.rename(filename_tmp, filename);
 }
 
-const CollectCtx = struct {
+const LinkCtx = struct {
     /// relative path to the b.cache_root
     cdb_dir_path: []const u8,
     /// reuse the same map to avoid allocating memory
@@ -188,7 +190,7 @@ const CollectCtx = struct {
 
 /// frag/*.json => cdb.raw \
 /// @return: `dirty` state
-fn collect(b: *std.Build, ctx: CollectCtx) !bool {
+fn link(b: *std.Build, ctx: LinkCtx) !bool {
     var dirty = false;
 
     // - $cdb_dir/
@@ -213,7 +215,7 @@ fn collect(b: *std.Build, ctx: CollectCtx) !bool {
 
     // check for new fragments
     const frag_dir = cdb_dir.openDir("frag", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return false, // that is ok
+        error.FileNotFound => return dirty, // that is ok
         else => return err,
     };
     defer frag_dir.close();
@@ -223,7 +225,7 @@ fn collect(b: *std.Build, ctx: CollectCtx) !bool {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
-        var file = cdb_dir.openFile(entry.name, .{}) catch continue;
+        var file = frag_dir.openFile(entry.name, .{}) catch continue;
         defer file.close();
 
         var reader = file.reader(reader_buf);
@@ -247,16 +249,18 @@ fn collect(b: *std.Build, ctx: CollectCtx) !bool {
     if (dirty)
         try save_cdb_map(b, &cdb_dir, cdb_map);
 
-    if (dirty or !access_cdb(b)) {
+    if (dirty or !access_cdb_json(&cdb_dir)) {
         try load_cdb_map(b, &cdb_dir, cdb_map, &cdb_map_loaded);
-        try save_cdb(b, cdb_map);
+        try save_cdb_json(b, &cdb_dir, cdb_map);
     }
 
     // delete the fragment files
     if (delete_files.items.len > 0) {
         var filename_iter = std.mem.splitScalar(u8, delete_files.items, '\n');
         while (filename_iter.next()) |filename| {
-            frag_dir.deleteFile(filename) catch {};
+            if (filename.len > 0) {
+                frag_dir.deleteFile(filename) catch {};
+            }
         }
     }
 
@@ -264,14 +268,10 @@ fn collect(b: *std.Build, ctx: CollectCtx) !bool {
 }
 
 fn is_cdb_dir(dirname: []const u8) bool {
-    // check if the directory is named like "arch-os-abi" (target triple)
-    var iter = std.mem.splitScalar(u8, dirname, '-');
-    var token_count = 0;
-    while (iter.next()) |_| token_count += 1;
-    return token_count == 3;
+    return std.mem.indexOfScalar(u8, dirname, '-') != null;
 }
 
-fn collect_all(b: *std.Build) !bool {
+fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
     var any_dirty = false;
 
     // - $cache_root/cdb/
@@ -279,11 +279,11 @@ fn collect_all(b: *std.Build) !bool {
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
-    var cdb_dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
+    var dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
-    defer cdb_dir.close();
+    defer dir.close();
 
     var cdb_map: std.StringHashMap([]const u8) = .init(b.allocator);
     defer cdb_map.deinit();
@@ -292,9 +292,9 @@ fn collect_all(b: *std.Build) !bool {
     defer b.allocator.free(reader_buf);
 
     var delete_files: std.ArrayList(u8) = .empty;
-    defer delete_files.deinit();
+    defer delete_files.deinit(b.allocator);
 
-    var dir_iter = cdb_dir.iterate();
+    var dir_iter = dir.iterate();
     while (try dir_iter.next()) |entry| {
         if (entry.kind != .directory) continue;
         if (!is_cdb_dir(entry.name)) continue;
@@ -303,12 +303,15 @@ fn collect_all(b: *std.Build) !bool {
         cdb_map.clearRetainingCapacity();
         delete_files.clearRetainingCapacity();
 
-        const dirty = collect(b, .{
+        const dirty = link(b, .{
             .cdb_dir_path = b.fmt("cdb/{s}", .{entry.name}),
             .cdb_map = &cdb_map,
             .reader_buf = reader_buf,
             .delete_files = &delete_files,
-        }) catch true;
+        }) catch |err| blk: {
+            try step.addError("link failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
+            break :blk true;
+        };
 
         if (dirty) any_dirty = true;
     }
@@ -351,13 +354,13 @@ fn gc(b: *std.Build, ctx: GcCtx) !bool {
     // save cdb_map
     if (dirty) {
         try save_cdb_map(b, &cdb_dir, cdb_map);
-        try save_cdb(b, cdb_map);
+        try save_cdb_json(b, &cdb_dir, cdb_map);
     }
 
     return dirty;
 }
 
-fn gc_all(b: *std.Build) !bool {
+fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
     var any_dirty = false;
 
     // - $cache_root/cdb/
@@ -365,16 +368,16 @@ fn gc_all(b: *std.Build) !bool {
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
-    var cdb_dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
+    var dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
-    defer cdb_dir.close();
+    defer dir.close();
 
     var cdb_map: std.StringHashMap([]const u8) = .init(b.allocator);
     defer cdb_map.deinit();
 
-    var dir_iter = cdb_dir.iterate();
+    var dir_iter = dir.iterate();
     while (try dir_iter.next()) |entry| {
         if (entry.kind != .directory) continue;
         if (!is_cdb_dir(entry.name)) continue;
@@ -385,7 +388,10 @@ fn gc_all(b: *std.Build) !bool {
         const dirty = gc(b, .{
             .cdb_dir_path = b.fmt("cdb/{s}", .{entry.name}),
             .cdb_map = &cdb_map,
-        }) catch true;
+        }) catch |err| blk: {
+            try step.addError("gc failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
+            break :blk true;
+        };
 
         if (dirty) any_dirty = true;
     }
@@ -393,17 +399,17 @@ fn gc_all(b: *std.Build) !bool {
     return any_dirty;
 }
 
-fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
+fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const b = step.owner;
-    const dirty = try collect_all(b);
+    const dirty = try link_all(b, step);
     if (!dirty) step.result_cached = true;
 }
 
 fn make_gc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const b = step.owner;
-    const dirty = try gc_all(b);
+    const dirty = try gc_all(b, step);
     if (!dirty) step.result_cached = true;
 }
 
