@@ -175,30 +175,51 @@ fn save_cdb(b: *std.Build, cdb_map: *const std.StringHashMap([]const u8)) !void 
     try b.build_root.handle.rename(filename_tmp, filename);
 }
 
-/// `.zig-cache/cdb/*.json` => compile_commands.json \
+const CollectCtx = struct {
+    /// relative path to the b.cache_root
+    cdb_dir_path: []const u8,
+    /// reuse the same map to avoid allocating memory
+    cdb_map: *std.StringHashMap([]const u8),
+    /// must be large enough to store the longest line
+    reader_buf: []u8,
+    /// each line is a fragment filename to be deleted
+    delete_files: *std.ArrayList(u8),
+};
+
+/// frag/*.json => cdb.raw \
 /// @return: `dirty` state
-fn update(b: *std.Build) !bool {
-    try b.cache_root.handle.makePath("cdb");
-    var cdb_dir = try b.cache_root.handle.openDir("cdb", .{ .iterate = true });
+fn collect(b: *std.Build, ctx: CollectCtx) !bool {
+    var dirty = false;
+
+    // - $cdb_dir/
+    //   - cdb.raw
+    //   - compile_commands.json
+    //   - frag/*.json
+    var cdb_dir = b.cache_root.handle.openDir(ctx.cdb_dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return dirty, // that is ok
+        else => return err,
+    };
     defer cdb_dir.close();
 
     // file_path -> fragment (lazy loaded)
-    var cdb_map: std.StringHashMap([]const u8) = .init(b.allocator);
-    defer cdb_map.deinit();
-
+    const cdb_map = ctx.cdb_map;
     var cdb_map_loaded = false;
-    var cdb_map_dirty = false;
-
-    var delete_files: std.ArrayList([]const u8) = .empty;
-    defer delete_files.deinit(b.allocator);
 
     // ensure that the longest line can be buffered
-    const reader_buf = try b.allocator.alloc(u8, 1024 * 1024);
-    defer b.allocator.free(reader_buf);
+    const reader_buf = ctx.reader_buf;
+
+    // delete the fragment files (after saving all files)
+    const delete_files = ctx.delete_files;
 
     // check for new fragments
-    var it = cdb_dir.iterate();
-    while (try it.next()) |entry| {
+    const frag_dir = cdb_dir.openDir("frag", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false, // that is ok
+        else => return err,
+    };
+    defer frag_dir.close();
+
+    var frag_dir_iter = frag_dir.iterate();
+    while (try frag_dir_iter.next()) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
@@ -213,83 +234,177 @@ fn update(b: *std.Build) !bool {
         fragment = format_fragment(b, fragment, path) orelse continue;
 
         // replace the fragment in the map
-        try load_cdb_map(b, &cdb_dir, &cdb_map, &cdb_map_loaded);
+        try load_cdb_map(b, &cdb_dir, cdb_map, &cdb_map_loaded);
         try cdb_map.put(path, fragment);
-        cdb_map_dirty = true;
 
         // delete the fragment file (after the iteration)
-        try delete_files.append(b.allocator, b.dupe(entry.name));
+        try delete_files.appendSlice(b.allocator, entry.name);
+        try delete_files.append(b.allocator, '\n');
+
+        dirty = true;
     }
 
-    if (cdb_map_dirty)
-        try save_cdb_map(b, &cdb_dir, &cdb_map);
+    if (dirty)
+        try save_cdb_map(b, &cdb_dir, cdb_map);
 
-    if (cdb_map_dirty or !access_cdb(b)) {
-        try load_cdb_map(b, &cdb_dir, &cdb_map, &cdb_map_loaded);
-        try save_cdb(b, &cdb_map);
+    if (dirty or !access_cdb(b)) {
+        try load_cdb_map(b, &cdb_dir, cdb_map, &cdb_map_loaded);
+        try save_cdb(b, cdb_map);
     }
 
-    // delete the fragment files (after saving all files)
-    for (delete_files.items) |file| {
-        cdb_dir.deleteFile(file) catch {};
+    // delete the fragment files
+    if (delete_files.items.len > 0) {
+        var filename_iter = std.mem.splitScalar(u8, delete_files.items, '\n');
+        while (filename_iter.next()) |filename| {
+            frag_dir.deleteFile(filename) catch {};
+        }
     }
 
-    return cdb_map_dirty;
+    return dirty;
 }
 
-/// @return: `changed` state
-fn perform_gc(b: *std.Build) !bool {
-    var cdb_dir = b.cache_root.handle.openDir("cdb", .{}) catch |err| switch (err) {
-        error.FileNotFound => return false, // that is ok
+fn is_cdb_dir(dirname: []const u8) bool {
+    // check if the directory is named like "arch-os-abi" (target triple)
+    var iter = std.mem.splitScalar(u8, dirname, '-');
+    var token_count = 0;
+    while (iter.next()) |_| token_count += 1;
+    return token_count == 3;
+}
+
+fn collect_all(b: *std.Build) !bool {
+    var any_dirty = false;
+
+    // - $cache_root/cdb/
+    //   - arch-os-abi/
+    //     - cdb.raw
+    //     - compile_commands.json
+    //     - frag/*.json
+    var cdb_dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
     defer cdb_dir.close();
 
-    var cdb_map = std.StringHashMap([]const u8).init(b.allocator);
+    var cdb_map: std.StringHashMap([]const u8) = .init(b.allocator);
     defer cdb_map.deinit();
 
-    try load_cdb_map(b, &cdb_dir, &cdb_map, null);
+    const reader_buf = try b.allocator.alloc(u8, 1024 * 1024);
+    defer b.allocator.free(reader_buf);
 
-    var delete_keys: std.ArrayList(*[]const u8) = .empty;
-    defer delete_keys.deinit(b.allocator);
+    var delete_files: std.ArrayList(u8) = .empty;
+    defer delete_files.deinit();
+
+    var dir_iter = cdb_dir.iterate();
+    while (try dir_iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!is_cdb_dir(entry.name)) continue;
+
+        // reset the container
+        cdb_map.clearRetainingCapacity();
+        delete_files.clearRetainingCapacity();
+
+        const dirty = collect(b, .{
+            .cdb_dir_path = b.fmt("cdb/{s}", .{entry.name}),
+            .cdb_map = &cdb_map,
+            .reader_buf = reader_buf,
+            .delete_files = &delete_files,
+        }) catch true;
+
+        if (dirty) any_dirty = true;
+    }
+
+    return any_dirty;
+}
+
+const GcCtx = struct {
+    /// relative path to the b.cache_root
+    cdb_dir_path: []const u8,
+    /// reuse the same map to avoid allocating memory
+    cdb_map: *std.StringHashMap([]const u8),
+};
+
+/// @return: `dirty` state
+fn gc(b: *std.Build, ctx: GcCtx) !bool {
+    var dirty = false;
+
+    var cdb_dir = b.cache_root.handle.openDir(ctx.cdb_dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return dirty, // that is ok
+        else => return err,
+    };
+    defer cdb_dir.close();
+
+    const cdb_map = ctx.cdb_map;
+    try load_cdb_map(b, &cdb_dir, cdb_map, null);
 
     // check for any deleted source files
     var it = cdb_map.keyIterator();
     while (it.next()) |p_path| {
         std.fs.cwd().access(p_path.*, .{}) catch |err| switch (err) {
-            error.FileNotFound => try delete_keys.append(b.allocator, p_path), // delete the entry after the iteration
+            error.FileNotFound => {
+                cdb_map.removeByPtr(p_path);
+                dirty = true;
+            },
             else => continue,
         };
     }
 
-    // no need to gc
-    if (delete_keys.items.len == 0)
-        return false;
-
-    // delete the entries
-    for (delete_keys.items) |p_path| {
-        _ = cdb_map.removeByPtr(p_path);
+    // save cdb_map
+    if (dirty) {
+        try save_cdb_map(b, &cdb_dir, cdb_map);
+        try save_cdb(b, cdb_map);
     }
 
-    // save cdb_map
-    try save_cdb_map(b, &cdb_dir, &cdb_map);
-    try save_cdb(b, &cdb_map);
+    return dirty;
+}
 
-    return true;
+fn gc_all(b: *std.Build) !bool {
+    var any_dirty = false;
+
+    // - $cache_root/cdb/
+    //   - arch-os-abi/
+    //     - cdb.raw
+    //     - compile_commands.json
+    //     - frag/*.json
+    var cdb_dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return any_dirty, // that is ok
+        else => return err,
+    };
+    defer cdb_dir.close();
+
+    var cdb_map: std.StringHashMap([]const u8) = .init(b.allocator);
+    defer cdb_map.deinit();
+
+    var dir_iter = cdb_dir.iterate();
+    while (try dir_iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!is_cdb_dir(entry.name)) continue;
+
+        // reset the container
+        cdb_map.clearRetainingCapacity();
+
+        const dirty = gc(b, .{
+            .cdb_dir_path = b.fmt("cdb/{s}", .{entry.name}),
+            .cdb_map = &cdb_map,
+        }) catch true;
+
+        if (dirty) any_dirty = true;
+    }
+
+    return any_dirty;
 }
 
 fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const b = step.owner;
-    const dirty = try update(b);
+    const dirty = try collect_all(b);
     if (!dirty) step.result_cached = true;
 }
 
 fn make_gc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const b = step.owner;
-    const changed = try perform_gc(b);
-    if (!changed) step.result_cached = true;
+    const dirty = try gc_all(b);
+    if (!dirty) step.result_cached = true;
 }
 
 /// please @import("zcdb") directly in your build.zig
