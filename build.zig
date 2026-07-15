@@ -24,20 +24,56 @@ fn extract_path(b: *std.Build, fragment: []const u8) ?[]const u8 {
     var dir: ?[]const u8 = null;
     var file: ?[]const u8 = null;
 
-    if (std.mem.indexOf(u8, fragment, "\"directory\": \"")) |idx| {
-        const start = idx + 14;
+    const dir_keyword = "\"directory\": \"";
+    const file_keyword = "\"file\": \"";
+
+    if (std.mem.indexOf(u8, fragment, dir_keyword)) |idx| {
+        const start = idx + dir_keyword.len;
         if (std.mem.indexOfScalarPos(u8, fragment, start, '"')) |end|
             dir = fragment[start..end];
     }
-    if (std.mem.indexOf(u8, fragment, "\"file\": \"")) |idx| {
-        const start = idx + 9;
+    if (std.mem.indexOf(u8, fragment, file_keyword)) |idx| {
+        const start = idx + file_keyword.len;
         if (std.mem.indexOfScalarPos(u8, fragment, start, '"')) |end|
             file = fragment[start..end];
     }
 
-    if (dir == null or file == null) return null;
+    if (dir == null or file == null)
+        return null;
 
-    return b.fmt("{s}{s}{s}", .{ dir.?, std.fs.path.sep_str, file.? });
+    return b.fmt("{s}{s}{s}", .{
+        dir.?,
+        std.fs.path.sep_str,
+        file.?,
+    });
+}
+
+/// the returns memory is owned by the caller
+fn format_fragment(b: *std.Build, fragment: []const u8, path: []const u8) ?[]const u8 {
+    // clang always emit single-line fragment with trailing comma
+    if (fragment.len == 0) return null;
+    if (fragment[fragment.len - 1] != ',') return null;
+
+    const file_ext = std.fs.path.extension(path);
+    if (file_ext.len == 0) return null;
+
+    const is_cpp =
+        std.ascii.eqlIgnoreCase(file_ext, ".cpp") or
+        std.ascii.eqlIgnoreCase(file_ext, ".cc") or
+        std.ascii.eqlIgnoreCase(file_ext, ".cxx") or
+        std.ascii.eqlIgnoreCase(file_ext, ".c++");
+
+    // replace the argv[0] with clang/clang++
+    const arg0_keyword = "\"arguments\": [\"";
+    const arg0_idx = std.mem.indexOf(u8, fragment, arg0_keyword) orelse return null;
+    const arg0_start = arg0_idx + arg0_keyword.len;
+    const arg0_end = std.mem.indexOfScalarPos(u8, fragment, arg0_start, '"') orelse return null;
+
+    return b.fmt("{s}{s}{s}", .{
+        fragment[0..arg0_start],
+        if (is_cpp) "clang++" else "clang",
+        fragment[arg0_end..(fragment.len - 1)],
+    });
 }
 
 fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap([]const u8), p_loaded: ?*bool) !void {
@@ -52,10 +88,11 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     };
     defer file.close();
 
+    // ensure that the longest line can be buffered
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
     defer b.allocator.free(buf);
 
-    var reader = file.reader(&buf);
+    var reader = file.reader(buf);
 
     while (true) {
         const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
@@ -155,31 +192,28 @@ fn update(b: *std.Build) !bool {
     var delete_files: std.ArrayList([]const u8) = .empty;
     defer delete_files.deinit(b.allocator);
 
+    // ensure that the longest line can be buffered
+    const reader_buf = try b.allocator.alloc(u8, 1024 * 1024);
+    defer b.allocator.free(reader_buf);
+
     // check for new fragments
     var it = cdb_dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
-        var fragment = cdb_dir.readFileAlloc(b.allocator, entry.name, 10 * 1024 * 1024) catch continue;
-        // the fragment memory cannot be freed
+        var file = cdb_dir.openFile(entry.name, .{}) catch continue;
+        defer file.close();
 
-        // trim the trailing newline
-        if (fragment.len > 0 and fragment[fragment.len - 1] == '\n')
-            fragment = fragment[0..(fragment.len - 1)];
+        var reader = file.reader(reader_buf);
+        var fragment = reader.interface.takeDelimiterExclusive('\n') catch continue;
 
-        // trim the trailing comma (,)
-        if (fragment.len > 0 and fragment[fragment.len - 1] == ',')
-            fragment = fragment[0..(fragment.len - 1)];
-
-        // the clang always emit single-line fragment
-        if (std.mem.indexOfScalar(u8, fragment, '\n') != null) continue;
-
-        // if the map is not loaded, load it
-        try load_cdb_map(b, &cdb_dir, &cdb_map, &cdb_map_loaded);
-
-        // overwrite the fragment in the map
+        // get the key and value (memory is owned)
         const path = extract_path(b, fragment) orelse continue;
+        fragment = format_fragment(b, fragment, path) orelse continue;
+
+        // replace the fragment in the map
+        try load_cdb_map(b, &cdb_dir, &cdb_map, &cdb_map_loaded);
         try cdb_map.put(path, fragment);
         cdb_map_dirty = true;
 
