@@ -1,20 +1,203 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 // ================================= API =================================
 
-pub fn create_step(b: *std.Build, name: []const u8) *std.Build.Step {
-    const step = b.step(name, "emit compile_commands.json");
-    step.makeFn = make_link;
-    return step;
-}
+/// please @import("zcdb") directly in your build.zig
+pub fn build(_: *std.Build) void {}
 
-pub fn create_gc_step(b: *std.Build, name: []const u8) *std.Build.Step {
-    const step = b.step(name, "gc compile_commands.json");
-    step.makeFn = make_gc;
-    return step;
-}
+/// ```zig
+/// // usage
+/// const zcdb = @import("zcdb");
+/// pub fn build(b: *std.Build) void {
+///     const zcdb_instance = zcdb.Instance.create(b, .{});
+///     defer zcdb_instance.finalize();
+///     // the build script logic ...
+/// }
+/// ```
+pub const Instance = struct {
+    b: *std.Build,
+    emit_flag: EmitFlag,
+    gc_step: ?*std.Build.Step,
+    visited: std.AutoHashMap(*std.Build.Step, void),
+    cdb_link: ?*CDBLink = null,
+
+    /// -Dcdb=yes -Dcdb=no -Dcdb=force
+    pub const EmitFlag = enum {
+        /// yes, emit compile_commands.json
+        yes,
+        /// force re-emit compile_commands.json
+        force,
+        /// no, do not emit compile_commands.json
+        no,
+    };
+
+    fn is_root_pkg(b: *std.Build) bool {
+        return b.pkg_hash.len == 0;
+    }
+
+    pub fn get_gc_step(self: *const Instance) *std.Build.Step {
+        return self.gc_step orelse @panic("available only in the root package");
+    }
+
+    pub const CreateOptions = struct {
+        /// the name of the gc step (manually invoke from the command line)
+        gc_step_name: []const u8 = "cdb-gc",
+    };
+
+    pub fn create(b: *std.Build, options: CreateOptions) *Instance {
+        if (!is_root_pkg(b)) {
+            const self = b.allocator.create(Instance) catch @panic("OOM");
+            self.* = .{
+                .b = b,
+                .emit_flag = .no,
+                .gc_step = null,
+                .visited = .init(b.allocator),
+            };
+            return self;
+        }
+
+        const emit_flag = b.option(EmitFlag, "cdb", "emit compile_commands.json") orelse .no;
+        switch (emit_flag) {
+            .yes, .force => {
+                // pass the info to zmake (https://github.com/zfl9/zmake)
+                b.graph.env_map.put("ZCDB_FLAG", @tagName(emit_flag)) catch unreachable;
+            },
+            .no => {},
+        }
+
+        const gc_step = b.step(options.gc_step_name, "gc compile_commands.json");
+        gc_step.makeFn = make_gc;
+
+        const self = b.allocator.create(Instance) catch @panic("OOM");
+        self.* = .{
+            .b = b,
+            .emit_flag = emit_flag,
+            .gc_step = gc_step,
+            .visited = .init(b.allocator),
+        };
+        return self;
+    }
+
+    pub fn finalize(self: *Instance) void {
+        defer self.visited.deinit();
+
+        switch (self.emit_flag) {
+            .yes, .force => {
+                const b = self.b;
+                assert(is_root_pkg(b));
+
+                // collect all cdb fragments
+                const cdb_link = CDBLink.create(b);
+                self.cdb_link = cdb_link;
+
+                for (b.getInstallStep().dependencies.items) |dep_step| {
+                    // inject the cdb flags into all compile steps
+                    self.traverse_step(dep_step);
+
+                    // link cdb fragments after all compile steps
+                    cdb_link.step.dependOn(dep_step);
+                }
+
+                // reference it in the install step
+                b.getInstallStep().dependOn(&cdb_link.step);
+            },
+
+            .no => {},
+        }
+    }
+
+    fn traverse_step(self: *Instance, step: *std.Build.Step) void {
+        // avoid traversing the same step twice
+        if (self.visited.contains(step)) return;
+        self.visited.put(step, {}) catch unreachable;
+
+        // inject the cdb flags into the compile step
+        if (step.cast(std.Build.Step.Compile)) |compile| {
+            self.update_compile(compile);
+        }
+
+        // iterate through its dependencies
+        for (step.dependencies.items) |dep_step| {
+            self.traverse_step(dep_step);
+        }
+    }
+
+    fn update_compile(self: *Instance, compile: *std.Build.Step.Compile) void {
+        const b = self.b;
+        const root_module = compile.root_module;
+
+        const target = (root_module.resolved_target orelse return).result; // TODO: handle the null case
+        const triple = target.zigTriple(b.allocator) catch unreachable;
+        const cpu = std.zig.serializeCpuAlloc(b.allocator, target.cpu) catch unreachable;
+
+        const dir_name = b.fmt("{s}@{s}", .{ triple, cpu });
+        self.cdb_link.?.record_dir_name(dir_name);
+
+        var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
+
+        // resolve to absolute path
+        const cdb_path = b.pathJoin(&.{ cache_root, "cdb", dir_name, "frag" });
+
+        // traverse all modules in the graph (root + import_table)
+        const mod_graph = root_module.getGraph();
+        for (mod_graph.modules) |mod| {
+            for (mod.link_objects.items) |*link_object| {
+                switch (link_object.*) {
+                    .c_source_file => |csf| {
+                        self.inject_cflag(&csf.flags, cdb_path);
+                    },
+                    .c_source_files => |csf| {
+                        self.inject_cflag(&csf.flags, cdb_path);
+                    },
+                    .other_step => |other| {
+                        self.traverse_step(&other.step);
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    fn inject_cflag(self: *Instance, flags: *[]const []const u8, frag_path: []const u8) void {
+        const b = self.b;
+        const old_flags = flags.*;
+        const new_flags = b.allocator.alloc([]const u8, old_flags.len + 2) catch unreachable;
+        @memcpy(new_flags[0..old_flags.len], old_flags);
+        new_flags[old_flags.len] = "-gen-cdb-fragment-path";
+        new_flags[old_flags.len + 1] = frag_path;
+        flags.* = new_flags;
+    }
+};
 
 // ================================= private =================================
+
+const CDBLink = struct {
+    step: std.Build.Step,
+    dir_name: ?[]const u8,
+
+    pub const base_id: std.Build.Step.Id = .custom;
+
+    pub fn create(b: *std.Build) *CDBLink {
+        const self = b.allocator.create(CDBLink) catch @panic("OOM");
+        self.* = .{
+            .step = .init(.{
+                .id = base_id,
+                .name = "cdb_link",
+                .owner = b,
+                .makeFn = make_link,
+            }),
+            .dir_name = null,
+        };
+        return self;
+    }
+
+    pub fn record_dir_name(self: *CDBLink, dir_name: []const u8) void {
+        if (self.dir_name != null) return;
+        self.dir_name = self.step.owner.dupe(dir_name);
+    }
+};
 
 const CDB_RAW_FILENAME = "cdb.raw";
 const CDB_FILENAME = "compile_commands.json";
@@ -267,15 +450,16 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
     return dirty;
 }
 
+/// "triple@cpu"
 fn is_cdb_dir(dirname: []const u8) bool {
-    return std.mem.indexOfScalar(u8, dirname, '-') != null;
+    return std.mem.indexOfScalar(u8, dirname, '@') != null;
 }
 
 fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
     var any_dirty = false;
 
     // - $cache_root/cdb/
-    //   - arch-os-abi/
+    //   - triple@cpu/
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
@@ -364,7 +548,7 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
     var any_dirty = false;
 
     // - $cache_root/cdb/
-    //   - arch-os-abi/
+    //   - triple@cpu/
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
@@ -399,19 +583,38 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
     return any_dirty;
 }
 
+/// CDBLink's make function
 fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const b = step.owner;
+    const self: *CDBLink = @fieldParentPtr("step", step);
+
     const dirty = try link_all(b, step);
     if (!dirty) step.result_cached = true;
+
+    // $build_root/compile_commands.json -> $cache_root/cdb/<triple@cpu>/compile_commands.json
+    if (self.dir_name) |dir_name| {
+        var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
+
+        var realpath_buf2: [std.fs.max_path_bytes]u8 = undefined;
+        const build_root = b.build_root.handle.realpath(".", &realpath_buf2) catch unreachable;
+
+        const abs_target_path = b.pathJoin(&.{ cache_root, "cdb", dir_name, CDB_FILENAME });
+        const target_path = try std.fs.path.relative(b.allocator, build_root, abs_target_path);
+
+        b.build_root.handle.deleteFile(CDB_FILENAME) catch |err| switch (err) {
+            error.FileNotFound => {}, // that's fine
+            else => return err,
+        };
+        try b.build_root.handle.symLink(target_path, CDB_FILENAME, .{});
+    }
 }
 
 fn make_gc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     _ = options;
     const b = step.owner;
+
     const dirty = try gc_all(b, step);
     if (!dirty) step.result_cached = true;
 }
-
-/// please @import("zcdb") directly in your build.zig
-pub fn build(_: *std.Build) void {}
