@@ -21,6 +21,7 @@ pub const Instance = struct {
     gc_step: ?*std.Build.Step,
     visited: std.AutoHashMap(*std.Build.Step, void),
     cdb_link: ?*CDBLink = null,
+    force_stamp: ?[]const u8 = null,
 
     /// -Dcdb=yes -Dcdb=no -Dcdb=force
     pub const EmitFlag = enum {
@@ -58,13 +59,19 @@ pub const Instance = struct {
         }
 
         const emit_flag = b.option(EmitFlag, "cdb", "emit compile_commands.json") orelse .no;
+
+        // pass the info to zmake (https://github.com/zfl9/zmake)
         switch (emit_flag) {
             .yes, .force => {
-                // pass the info to zmake (https://github.com/zfl9/zmake)
                 b.graph.env_map.put("ZCDB_FLAG", @tagName(emit_flag)) catch unreachable;
             },
             .no => {},
         }
+
+        const force_stamp = switch (emit_flag) {
+            .force => b.fmt("-DZCDB__FORCE__={d}", .{std.time.milliTimestamp()}),
+            else => null,
+        };
 
         const gc_step = b.step(options.gc_step_name, "gc compile_commands.json");
         gc_step.makeFn = make_gc;
@@ -75,6 +82,7 @@ pub const Instance = struct {
             .emit_flag = emit_flag,
             .gc_step = gc_step,
             .visited = .init(b.allocator),
+            .force_stamp = force_stamp,
         };
         return self;
     }
@@ -162,11 +170,28 @@ pub const Instance = struct {
 
     fn inject_cflag(self: *Instance, flags: *[]const []const u8, frag_path: []const u8) void {
         const b = self.b;
+
         const old_flags = flags.*;
-        const new_flags = b.allocator.alloc([]const u8, old_flags.len + 2) catch unreachable;
-        @memcpy(new_flags[0..old_flags.len], old_flags);
-        new_flags[old_flags.len] = "-gen-cdb-fragment-path";
-        new_flags[old_flags.len + 1] = frag_path;
+        var new_flags: [][]const u8 = undefined;
+
+        switch (self.emit_flag) {
+            .yes => {
+                new_flags = b.allocator.alloc([]const u8, old_flags.len + 2) catch unreachable;
+                @memcpy(new_flags[0..old_flags.len], old_flags);
+                new_flags[old_flags.len] = "-gen-cdb-fragment-path";
+                new_flags[old_flags.len + 1] = frag_path;
+            },
+            .force => {
+                // inject force stamp to invalidate zig compilation cache
+                new_flags = b.allocator.alloc([]const u8, old_flags.len + 3) catch unreachable;
+                @memcpy(new_flags[0..old_flags.len], old_flags);
+                new_flags[old_flags.len] = "-gen-cdb-fragment-path";
+                new_flags[old_flags.len + 1] = frag_path;
+                new_flags[old_flags.len + 2] = self.force_stamp.?;
+            },
+            .no => unreachable,
+        }
+
         flags.* = new_flags;
     }
 };
