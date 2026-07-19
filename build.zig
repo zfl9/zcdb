@@ -330,15 +330,6 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
     defer b.allocator.free(buf);
 
-    // check file size and first bytes
-    const file_size = try file.getEndPos();
-    std.debug.print("      load_cdb_map: file size={}\n", .{file_size});
-    if (file_size > 0) {
-        var header: [64]u8 = undefined;
-        const n = try file.preadAll(&header, 0);
-        std.debug.print("      load_cdb_map: first {} bytes: {x:2}\n", .{ n, header[0..n] });
-    }
-
     std.debug.print("      load_cdb_map: buffer allocated, creating reader...\n", .{});
 
     var reader = file.reader(buf);
