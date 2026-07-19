@@ -323,10 +323,10 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     var reader = file.reader(buf);
 
     while (true) {
-        const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
+        const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return err,
+            else => |e| return e,
+        } orelse break;
         if (line.len == 0) continue;
 
         const path = extract_path(b, line) orelse continue;
@@ -456,7 +456,7 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
         defer file.close();
 
         var reader = file.reader(reader_buf);
-        var fragment: []const u8 = reader.interface.takeDelimiterExclusive('\n') catch continue;
+        var fragment: []const u8 = reader.interface.takeDelimiter('\n') catch continue orelse continue;
 
         // get the key and value (memory is owned)
         const path = extract_path(b, fragment) orelse continue;
