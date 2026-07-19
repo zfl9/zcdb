@@ -346,34 +346,15 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     std.debug.print("      load_cdb_map: reading lines...\n", .{});
 
     var line_count: usize = 0;
-    var empty_count: usize = 0;
     while (true) {
-        const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => {
-                std.debug.print("      load_cdb_map: EOF after {} lines ({} empty)\n", .{ line_count, empty_count });
-                break;
-            },
-            else => return err,
-        };
-        if (line.len == 0) {
-            empty_count += 1;
-            if (empty_count <= 5) {
-                std.debug.print("      load_cdb_map: empty line #{}\n", .{empty_count});
-            }
-            if (empty_count == 100) {
-                std.debug.print("      load_cdb_map: too many empty lines (>100), aborting\n", .{});
-                return error.TooManyEmptyLines;
-            }
-            continue;
-        }
-        empty_count = 0;
+        const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return err,
+            else => |e| return e,
+        } orelse break;
 
-        std.debug.print("      load_cdb_map: line {} (len={})\n", .{ line_count + 1, line.len });
+        if (line.len == 0) continue;
 
-        const path = extract_path(b, line) orelse {
-            std.debug.print("      load_cdb_map: extract_path failed, content: '{s}'\n", .{line[0..@min(line.len, 80)]});
-            continue;
-        };
+        const path = extract_path(b, line) orelse continue;
         const fragment = b.dupe(line);
         try cdb_map.put(path, fragment);
         line_count += 1;
