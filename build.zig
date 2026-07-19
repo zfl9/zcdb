@@ -172,7 +172,7 @@ pub const Instance = struct {
         switch (self.emit) {
             .yes, .force => {
                 const old_flags = flags.*;
-                const extra_slots = if (self.emit == .force) 3 else 2;
+                const extra_slots: usize = if (self.emit == .force) 3 else 2;
                 const new_flags = self.b.allocator.alloc([]const u8, old_flags.len + extra_slots) catch unreachable;
                 @memcpy(new_flags[0..old_flags.len], old_flags);
                 new_flags[old_flags.len] = "-gen-cdb-fragment-path";
@@ -191,7 +191,7 @@ pub fn require_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const 
     const emit = Emit.from(b.graph.env_map.get(ENV_EMIT) orelse return null).?;
     switch (emit) {
         .yes, .force => {
-            const extra_slots = if (emit == .force) 3 else 2;
+            const extra_slots: usize = if (emit == .force) 3 else 2;
             const cflags = b.allocator.alloc([]const u8, extra_slots) catch unreachable;
             cflags[0] = "-gen-cdb-fragment-path";
             cflags[1] = compute_frag_path(b, target);
