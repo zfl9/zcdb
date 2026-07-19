@@ -310,6 +310,8 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
         loaded.* = true;
     }
 
+    std.debug.print("      load_cdb_map: opening {s}...\n", .{CDB_RAW_FILENAME});
+
     var file = cdb_dir.openFile(CDB_RAW_FILENAME, .{}) catch |err| switch (err) {
         error.FileNotFound => return, // that is ok
         else => return err,
@@ -322,6 +324,7 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
 
     var reader = file.reader(buf);
 
+    var line_count: usize = 0;
     while (true) {
         const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.EndOfStream => break,
@@ -332,13 +335,18 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
         const path = extract_path(b, line) orelse continue;
         const fragment = b.dupe(line);
         try cdb_map.put(path, fragment);
+        line_count += 1;
     }
+
+    std.debug.print("      load_cdb_map: done, {} lines loaded\n", .{line_count});
 }
 
 /// save cdb_map to $cdb_dir/cdb.raw
 fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringHashMap([]const u8)) !void {
     const filename = CDB_RAW_FILENAME;
     const filename_tmp = filename ++ ".tmp";
+
+    std.debug.print("      save_cdb_map: writing {} entries...\n", .{cdb_map.count()});
 
     const file = try cdb_dir.createFile(filename_tmp, .{});
     defer file.close();
@@ -359,6 +367,8 @@ fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringH
 
     // atomic rename
     try cdb_dir.rename(filename_tmp, filename);
+
+    std.debug.print("      save_cdb_map: done\n", .{});
 }
 
 /// test if $cdb_dir/compile_commands.json exists
@@ -371,6 +381,8 @@ fn access_cdb_json(cdb_dir: *std.fs.Dir) bool {
 fn save_cdb_json(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringHashMap([]const u8)) !void {
     const filename = CDB_JSON_FILENAME;
     const filename_tmp = filename ++ ".tmp";
+
+    std.debug.print("      save_cdb_json: writing {} entries...\n", .{cdb_map.count()});
 
     const file = try cdb_dir.createFile(filename_tmp, .{});
     defer file.close();
@@ -402,6 +414,8 @@ fn save_cdb_json(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.String
 
     // atomic rename
     try cdb_dir.rename(filename_tmp, filename);
+
+    std.debug.print("      save_cdb_json: done\n", .{});
 }
 
 const LinkCtx = struct {
@@ -419,6 +433,8 @@ const LinkCtx = struct {
 /// @return: `dirty` state
 fn link(b: *std.Build, ctx: LinkCtx) !bool {
     var dirty = false;
+
+    std.debug.print("    link: open cdb_dir '{s}'\n", .{ctx.cdb_dir_path});
 
     // - $cdb_dir/
     //   - cdb.raw
@@ -441,16 +457,20 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
     const delete_files = ctx.delete_files;
 
     // check for new fragments
+    std.debug.print("    link: open frag dir\n", .{});
     var frag_dir = cdb_dir.openDir(FRAG_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return dirty, // that is ok
         else => return err,
     };
     defer frag_dir.close();
 
+    std.debug.print("    link: iterating frag files...\n", .{});
     var frag_dir_iter = frag_dir.iterate();
     while (try frag_dir_iter.next()) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+
+        std.debug.print("    link: processing '{s}'...\n", .{entry.name});
 
         var file = frag_dir.openFile(entry.name, .{}) catch continue;
         defer file.close();
@@ -473,6 +493,8 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
         dirty = true;
     }
 
+    std.debug.print("    link: saving cdb_map, dirty={}\n", .{dirty});
+
     if (dirty)
         try save_cdb_map(b, &cdb_dir, cdb_map);
 
@@ -483,6 +505,7 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
 
     // delete the fragment files
     if (delete_files.items.len > 0) {
+        std.debug.print("    link: deleting {} frag files...\n", .{delete_files.items.len});
         var filename_iter = std.mem.splitScalar(u8, delete_files.items, '\n');
         while (filename_iter.next()) |filename| {
             if (filename.len > 0) {
@@ -491,6 +514,7 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
         }
     }
 
+    std.debug.print("    link: done, dirty={}\n", .{dirty});
     return dirty;
 }
 
@@ -501,6 +525,8 @@ fn is_cdb_dir(dirname: []const u8) bool {
 
 fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
     var any_dirty = false;
+
+    std.debug.print("  link_all: open CDB_BASE_DIR\n", .{});
 
     // - $cache_root/cdb/
     //   - triple@cpu/
@@ -527,6 +553,8 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
         if (entry.kind != .directory) continue;
         if (!is_cdb_dir(entry.name)) continue;
 
+        std.debug.print("  link_all: processing dir '{s}'\n", .{entry.name});
+
         // reset the container
         cdb_map.clearRetainingCapacity();
         delete_files.clearRetainingCapacity();
@@ -541,9 +569,12 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
             break :blk true;
         };
 
+        std.debug.print("  link_all: dir '{s}' dirty={}\n", .{ entry.name, dirty });
+
         if (dirty) any_dirty = true;
     }
 
+    std.debug.print("  link_all: done, any_dirty={}\n", .{any_dirty});
     return any_dirty;
 }
 
@@ -633,8 +664,12 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     const b = step.owner;
     const self: *CDBLink = @fieldParentPtr("step", step);
 
+    std.debug.print("make_link: start\n", .{});
+
     const dirty = try link_all(b, step);
     if (!dirty) step.result_cached = true;
+
+    std.debug.print("make_link: link_all done, creating symlink...\n", .{});
 
     // $build_root/compile_commands.json -> $cache_root/cdb/$triple/compile_commands.json
     var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -651,6 +686,8 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
         else => return err,
     };
     try b.build_root.handle.symLink(target_path, CDB_JSON_FILENAME, .{});
+
+    std.debug.print("make_link: done\n", .{});
 }
 
 fn make_gc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
