@@ -74,7 +74,7 @@ pub const CreateOptions = struct {
 
 ### `require_cflags(b, target) → ?[]const []const u8`
 
-获取 zcdb 所需的编译 flags，若未启用则返回 `null`。供 zmake 等外部构建系统集成使用：
+获取 zcdb 所需的编译 flags，若未启用则返回 `null`。用于外部构建系统的集成。
 
 ```zig
 if (zcdb.require_cflags(b, target)) |cflags| {
@@ -82,8 +82,12 @@ if (zcdb.require_cflags(b, target)) |cflags| {
 }
 ```
 
-## zmake 集成
+## 已知限制
 
-> zmake 已自动集成 zcdb，无需额外配置与干预。
+zcdb 的 `compile_commands.json` 反映的是**最近一次实际触发的 C/C++ 编译记录**，而非当前 `zig build` 的构建上下文。这是因为 Zig 编译缓存可能命中了某个历史构建，此时 `zig cc`/`zig c++` 并未执行，cdb 数据未得到更新，仍然是上一次触发编译时的记录。
 
-zcdb 通过 `b.graph.env_map` 写入 `ZCDB_EMIT`、`ZCDB_STAMP`，同一构建图内的所有包均可读取。
+解决方法：
+
+- 日常增量开发不受影响（源码不断修改，自然触发增量编译）
+- 若怀疑 cdb 滞后，执行 `zig build -Dcdb=force` 强制触发重新构建
+- 或者删除 `.zig-cache/` 本地缓存目录，再重新构建，获得完全干净的 cdb
