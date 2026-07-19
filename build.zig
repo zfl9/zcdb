@@ -1,13 +1,17 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const ENV_EMIT = "ZCDB_EMIT";
+const ENV_STAMP = "ZCDB_STAMP";
+const CDB_RAW_FILENAME = "cdb.raw";
+const CDB_JSON_FILENAME = "compile_commands.json";
+const CDB_DIR = "cdb";
+const FRAG_DIR = "frag";
+
 // ================================= API =================================
 
 /// please @import("zcdb") directly in your build.zig
 pub fn build(_: *std.Build) void {}
-
-const ENV_EMIT = "ZCDB_EMIT";
-const ENV_STAMP = "ZCDB_STAMP";
 
 pub const Emit = enum {
     /// yes, emit compile_commands.json
@@ -144,11 +148,11 @@ pub const Instance = struct {
 
         // the root module's target is always available
         const target = root_module.resolved_target orelse return;
-        const dir_name = compute_dir_name(b, target);
-        const frag_path = compute_frag_path(b, dir_name);
+        const triple = compute_triple(b, target);
+        const frag_path = compute_frag_path(b, triple);
 
         // record the dir name for the cdb link step
-        self.cdb_link.?.record_dir_name(dir_name);
+        self.cdb_link.?.record_triple(triple);
 
         // traverse all modules in the graph (root + import_table)
         const mod_graph = root_module.getGraph();
@@ -156,10 +160,10 @@ pub const Instance = struct {
             for (mod.link_objects.items) |*link_object| {
                 switch (link_object.*) {
                     .c_source_file => |csf| {
-                        self.inject_cflag(&csf.flags, frag_path);
+                        self.inject_cflags(&csf.flags, frag_path);
                     },
                     .c_source_files => |csf| {
-                        self.inject_cflag(&csf.flags, frag_path);
+                        self.inject_cflags(&csf.flags, frag_path);
                     },
                     .other_step => |other| {
                         self.traverse_step(&other.step);
@@ -170,7 +174,7 @@ pub const Instance = struct {
         }
     }
 
-    fn inject_cflag(self: *Instance, flags: *[]const []const u8, frag_path: []const u8) void {
+    fn inject_cflags(self: *Instance, flags: *[]const []const u8, frag_path: []const u8) void {
         const b = self.b;
 
         const old_flags = flags.*;
@@ -198,21 +202,21 @@ pub const Instance = struct {
     }
 };
 
-/// Returns the extra C compiler flags needed to emit cdb fragments. \
+/// Returns the extra C compiler flags required to emit cdb fragments. \
 /// Returns null if zcdb is not enabled in this build. \
-pub fn get_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const []const u8 {
-    const emit = Emit.from(b.graph.env_map.get("ZCDB_EMIT") orelse return null).?;
+pub fn require_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const []const u8 {
+    const emit = Emit.from(b.graph.env_map.get(ENV_EMIT) orelse return null).?;
     return switch (emit) {
         .yes => r: {
             const cflags = b.allocator.alloc([]const u8, 2) catch unreachable;
             cflags[0] = "-gen-cdb-fragment-path";
-            cflags[1] = compute_frag_path(b, compute_dir_name(b, target));
+            cflags[1] = compute_frag_path(b, compute_triple(b, target));
             break :r cflags;
         },
         .force => r: {
             const cflags = b.allocator.alloc([]const u8, 3) catch unreachable;
             cflags[0] = "-gen-cdb-fragment-path";
-            cflags[1] = compute_frag_path(b, compute_dir_name(b, target));
+            cflags[1] = compute_frag_path(b, compute_triple(b, target));
             cflags[2] = compute_force_cflag(b, null);
             break :r cflags;
         },
@@ -232,21 +236,21 @@ fn compute_force_cflag(b: *std.Build, in_stamp: ?[]const u8) []const u8 {
     return b.fmt("-DZCDB__FORCE__={s}", .{stamp});
 }
 
-fn compute_dir_name(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
+fn compute_triple(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     const triple = target.result.zigTriple(b.allocator) catch unreachable;
     const cpu = std.zig.serializeCpuAlloc(b.allocator, target.result.cpu) catch unreachable;
     return b.fmt("{s}@{s}", .{ triple, cpu });
 }
 
-fn compute_frag_path(b: *std.Build, dir_name: []const u8) []const u8 {
+fn compute_frag_path(b: *std.Build, triple: []const u8) []const u8 {
     var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
-    return b.pathJoin(&.{ cache_root, "cdb", dir_name, "frag" });
+    return b.pathJoin(&.{ cache_root, CDB_DIR, triple, FRAG_DIR });
 }
 
 const CDBLink = struct {
     step: std.Build.Step,
-    dir_name: ?[]const u8,
+    triple: ?[]const u8,
 
     pub const base_id: std.Build.Step.Id = .custom;
 
@@ -259,19 +263,16 @@ const CDBLink = struct {
                 .owner = b,
                 .makeFn = make_link,
             }),
-            .dir_name = null,
+            .triple = null,
         };
         return self;
     }
 
-    pub fn record_dir_name(self: *CDBLink, dir_name: []const u8) void {
-        if (self.dir_name != null) return;
-        self.dir_name = self.step.owner.dupe(dir_name);
+    pub fn record_triple(self: *CDBLink, triple: []const u8) void {
+        if (self.triple != null) return;
+        self.triple = self.step.owner.dupe(triple);
     }
 };
-
-const CDB_RAW_FILENAME = "cdb.raw";
-const CDB_FILENAME = "compile_commands.json";
 
 /// the returns memory is owned by the caller
 fn extract_path(b: *std.Build, fragment: []const u8) ?[]const u8 {
@@ -386,13 +387,13 @@ fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringH
 
 /// test if $cdb_dir/compile_commands.json exists
 fn access_cdb_json(cdb_dir: *std.fs.Dir) bool {
-    cdb_dir.access(CDB_FILENAME, .{}) catch return false;
+    cdb_dir.access(CDB_JSON_FILENAME, .{}) catch return false;
     return true;
 }
 
 /// save to $cdb_dir/compile_commands.json
 fn save_cdb_json(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringHashMap([]const u8)) !void {
-    const filename = CDB_FILENAME;
+    const filename = CDB_JSON_FILENAME;
     const filename_tmp = filename ++ ".tmp";
 
     const file = try cdb_dir.createFile(filename_tmp, .{});
@@ -464,7 +465,7 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
     const delete_files = ctx.delete_files;
 
     // check for new fragments
-    const frag_dir = cdb_dir.openDir("frag", .{ .iterate = true }) catch |err| switch (err) {
+    const frag_dir = cdb_dir.openDir(FRAG_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return dirty, // that is ok
         else => return err,
     };
@@ -530,7 +531,7 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
-    var dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
+    var dir = b.cache_root.handle.openDir(CDB_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
@@ -555,7 +556,7 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
         delete_files.clearRetainingCapacity();
 
         const dirty = link(b, .{
-            .cdb_dir_path = b.pathJoin(&.{ "cdb", entry.name }),
+            .cdb_dir_path = b.pathJoin(&.{ CDB_DIR, entry.name }),
             .cdb_map = &cdb_map,
             .reader_buf = reader_buf,
             .delete_files = &delete_files,
@@ -619,7 +620,7 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
-    var dir = b.cache_root.handle.openDir("cdb", .{ .iterate = true }) catch |err| switch (err) {
+    var dir = b.cache_root.handle.openDir(CDB_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
@@ -637,7 +638,7 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
         cdb_map.clearRetainingCapacity();
 
         const dirty = gc(b, .{
-            .cdb_dir_path = b.pathJoin(&.{ "cdb", entry.name }),
+            .cdb_dir_path = b.pathJoin(&.{ CDB_DIR, entry.name }),
             .cdb_map = &cdb_map,
         }) catch |err| blk: {
             try step.addError("gc failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
@@ -659,22 +660,22 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     const dirty = try link_all(b, step);
     if (!dirty) step.result_cached = true;
 
-    // $build_root/compile_commands.json -> $cache_root/cdb/<triple@cpu>/compile_commands.json
-    if (self.dir_name) |dir_name| {
+    // $build_root/compile_commands.json -> $cache_root/cdb/$triple/compile_commands.json
+    if (self.triple) |triple| {
         var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
 
         var realpath_buf2: [std.fs.max_path_bytes]u8 = undefined;
         const build_root = b.build_root.handle.realpath(".", &realpath_buf2) catch unreachable;
 
-        const abs_target_path = b.pathJoin(&.{ cache_root, "cdb", dir_name, CDB_FILENAME });
+        const abs_target_path = b.pathJoin(&.{ cache_root, CDB_DIR, triple, CDB_JSON_FILENAME });
         const target_path = try std.fs.path.relative(b.allocator, build_root, abs_target_path);
 
-        b.build_root.handle.deleteFile(CDB_FILENAME) catch |err| switch (err) {
+        b.build_root.handle.deleteFile(CDB_JSON_FILENAME) catch |err| switch (err) {
             error.FileNotFound => {}, // that's fine
             else => return err,
         };
-        try b.build_root.handle.symLink(target_path, CDB_FILENAME, .{});
+        try b.build_root.handle.symLink(target_path, CDB_JSON_FILENAME, .{});
     }
 }
 
