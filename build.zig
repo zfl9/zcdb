@@ -6,6 +6,9 @@ const assert = std.debug.assert;
 /// please @import("zcdb") directly in your build.zig
 pub fn build(_: *std.Build) void {}
 
+const ENV_EMIT = "ZCDB_EMIT";
+const ENV_STAMP = "ZCDB_STAMP";
+
 /// ```zig
 /// // usage
 /// const zcdb = @import("zcdb");
@@ -17,14 +20,14 @@ pub fn build(_: *std.Build) void {}
 /// ```
 pub const Instance = struct {
     b: *std.Build,
-    emit_flag: EmitFlag,
-    gc_step: ?*std.Build.Step,
+    emit: Emit,
+    force_cflag: ?[]const u8,
+    gc_step: *std.Build.Step,
     visited: std.AutoHashMap(*std.Build.Step, void),
     cdb_link: ?*CDBLink = null,
-    force_stamp: ?[]const u8 = null,
 
     /// -Dcdb=yes -Dcdb=no -Dcdb=force
-    pub const EmitFlag = enum {
+    pub const Emit = enum {
         /// yes, emit compile_commands.json
         yes,
         /// force re-emit compile_commands.json
@@ -38,51 +41,49 @@ pub const Instance = struct {
     }
 
     pub fn get_gc_step(self: *const Instance) *std.Build.Step {
-        return self.gc_step orelse @panic("available only in the root package");
+        return self.gc_step;
     }
 
     pub const CreateOptions = struct {
-        /// the name of the gc step (manually invoke from the command line)
+        /// cli option name (zig build -Dcdb=yes)
+        emit_option_name: []const u8 = "cdb",
+
+        /// gc step name (zig build cdb-gc)
         gc_step_name: []const u8 = "cdb-gc",
     };
 
     pub fn create(b: *std.Build, options: CreateOptions) *Instance {
-        if (!is_root_pkg(b)) {
-            const self = b.allocator.create(Instance) catch @panic("OOM");
-            self.* = .{
-                .b = b,
-                .emit_flag = .no,
-                .gc_step = null,
-                .visited = .init(b.allocator),
-            };
-            return self;
-        }
+        const emit = if (is_root_pkg(b))
+            b.option(Emit, options.emit_option_name, "emit compile_commands.json") orelse .no
+        else
+            .no;
 
-        const emit_flag = b.option(EmitFlag, "cdb", "emit compile_commands.json") orelse .no;
-
-        // pass the info to zmake (https://github.com/zfl9/zmake)
-        switch (emit_flag) {
+        switch (emit) {
             .yes, .force => {
-                b.graph.env_map.put("ZCDB_FLAG", @tagName(emit_flag)) catch unreachable;
+                b.graph.env_map.put(ENV_EMIT, @tagName(emit)) catch unreachable;
             },
             .no => {},
         }
 
-        const force_stamp = switch (emit_flag) {
-            .force => b.fmt("-DZCDB__FORCE__={d}", .{std.time.milliTimestamp()}),
+        const force_cflag = switch (emit) {
+            .force => cflag: {
+                const stamp = b.fmt("{d}", .{std.time.milliTimestamp()});
+                b.graph.env_map.put(ENV_STAMP, stamp) catch unreachable;
+                break :cflag compute_force_cflag(b, stamp);
+            },
             else => null,
         };
 
         const gc_step = b.step(options.gc_step_name, "gc compile_commands.json");
-        gc_step.makeFn = make_gc;
+        if (is_root_pkg(b)) gc_step.makeFn = make_gc;
 
         const self = b.allocator.create(Instance) catch @panic("OOM");
         self.* = .{
             .b = b,
-            .emit_flag = emit_flag,
+            .emit = emit,
+            .force_cflag = force_cflag,
             .gc_step = gc_step,
             .visited = .init(b.allocator),
-            .force_stamp = force_stamp,
         };
         return self;
     }
@@ -90,13 +91,14 @@ pub const Instance = struct {
     pub fn finalize(self: *Instance) void {
         defer self.visited.deinit();
 
-        switch (self.emit_flag) {
+        switch (self.emit) {
             .yes, .force => {
                 const b = self.b;
                 assert(is_root_pkg(b));
 
                 // collect all cdb fragments
                 const cdb_link = CDBLink.create(b);
+                assert(self.cdb_link == null);
                 self.cdb_link = cdb_link;
 
                 for (b.getInstallStep().dependencies.items) |dep_step| {
@@ -135,18 +137,13 @@ pub const Instance = struct {
         const b = self.b;
         const root_module = compile.root_module;
 
-        const target = (root_module.resolved_target orelse return).result; // TODO: handle the null case
-        const triple = target.zigTriple(b.allocator) catch unreachable;
-        const cpu = std.zig.serializeCpuAlloc(b.allocator, target.cpu) catch unreachable;
+        // the root module's target is always available
+        const target = (root_module.resolved_target orelse return).result;
+        const dir_name = compute_dir_name(b, target);
+        const cdb_path = compute_frag_path(b, dir_name);
 
-        const dir_name = b.fmt("{s}@{s}", .{ triple, cpu });
+        // record the dir name for the cdb link step
         self.cdb_link.?.record_dir_name(dir_name);
-
-        var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
-
-        // resolve to absolute path
-        const cdb_path = b.pathJoin(&.{ cache_root, "cdb", dir_name, "frag" });
 
         // traverse all modules in the graph (root + import_table)
         const mod_graph = root_module.getGraph();
@@ -174,7 +171,7 @@ pub const Instance = struct {
         const old_flags = flags.*;
         var new_flags: [][]const u8 = undefined;
 
-        switch (self.emit_flag) {
+        switch (self.emit) {
             .yes => {
                 new_flags = b.allocator.alloc([]const u8, old_flags.len + 2) catch unreachable;
                 @memcpy(new_flags[0..old_flags.len], old_flags);
@@ -187,7 +184,7 @@ pub const Instance = struct {
                 @memcpy(new_flags[0..old_flags.len], old_flags);
                 new_flags[old_flags.len] = "-gen-cdb-fragment-path";
                 new_flags[old_flags.len + 1] = frag_path;
-                new_flags[old_flags.len + 2] = self.force_stamp.?;
+                new_flags[old_flags.len + 2] = self.force_cflag.?;
             },
             .no => unreachable,
         }
@@ -196,7 +193,38 @@ pub const Instance = struct {
     }
 };
 
+/// Returns the extra C compiler flags needed to emit cdb fragments. \
+/// Returns null if zcdb is not enabled in this build. \
+pub fn get_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const []const u8 {
+    const emit = b.graph.env_map.get("ZCDB_EMIT") orelse return null;
+    const emit_force = std.mem.eql(u8, emit, "force");
+    const frag_path = compute_frag_path(b, compute_dir_name(b, target.result));
+    const cflags = b.allocator.alloc([]const u8, if (emit_force) 3 else 2) catch unreachable;
+    cflags[0] = "-gen-cdb-fragment-path";
+    cflags[1] = frag_path;
+    if (emit_force) cflags[2] = compute_force_cflag(b, null);
+    return cflags;
+}
+
 // ================================= private =================================
+
+/// `in_stamp` null means read from env_map
+fn compute_force_cflag(b: *std.Build, in_stamp: ?[]const u8) []const u8 {
+    const stamp = in_stamp orelse b.graph.env_map.get(ENV_STAMP) orelse unreachable;
+    return b.fmt("-DZCDB__FORCE__={s}", .{stamp});
+}
+
+fn compute_dir_name(b: *std.Build, target: std.Target) []const u8 {
+    const triple = target.zigTriple(b.allocator) catch unreachable;
+    const cpu = std.zig.serializeCpuAlloc(b.allocator, target.cpu) catch unreachable;
+    return b.fmt("{s}@{s}", .{ triple, cpu });
+}
+
+fn compute_frag_path(b: *std.Build, dir_name: []const u8) []const u8 {
+    var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
+    return b.pathJoin(&.{ cache_root, "cdb", dir_name, "frag" });
+}
 
 const CDBLink = struct {
     step: std.Build.Step,
@@ -249,11 +277,7 @@ fn extract_path(b: *std.Build, fragment: []const u8) ?[]const u8 {
     if (dir == null or file == null)
         return null;
 
-    return b.fmt("{s}{s}{s}", .{
-        dir.?,
-        std.fs.path.sep_str,
-        file.?,
-    });
+    return b.pathJoin(&.{ dir.?, file.? });
 }
 
 /// the returns memory is owned by the caller
@@ -513,7 +537,7 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
         delete_files.clearRetainingCapacity();
 
         const dirty = link(b, .{
-            .cdb_dir_path = b.fmt("cdb/{s}", .{entry.name}),
+            .cdb_dir_path = b.pathJoin(&.{ "cdb", entry.name }),
             .cdb_map = &cdb_map,
             .reader_buf = reader_buf,
             .delete_files = &delete_files,
@@ -595,7 +619,7 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
         cdb_map.clearRetainingCapacity();
 
         const dirty = gc(b, .{
-            .cdb_dir_path = b.fmt("cdb/{s}", .{entry.name}),
+            .cdb_dir_path = b.pathJoin(&.{ "cdb", entry.name }),
             .cdb_map = &cdb_map,
         }) catch |err| blk: {
             try step.addError("gc failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
