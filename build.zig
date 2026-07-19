@@ -330,6 +330,15 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
     defer b.allocator.free(buf);
 
+    // check file size and first bytes
+    const file_size = try file.getEndPos();
+    std.debug.print("      load_cdb_map: file size={}\n", .{file_size});
+    if (file_size > 0) {
+        var header: [64]u8 = undefined;
+        const n = try file.preadAll(&header, 0);
+        std.debug.print("      load_cdb_map: first {} bytes: {x:2}\n", .{ n, header[0..n] });
+    }
+
     std.debug.print("      load_cdb_map: buffer allocated, creating reader...\n", .{});
 
     var reader = file.reader(buf);
@@ -337,21 +346,32 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     std.debug.print("      load_cdb_map: reading lines...\n", .{});
 
     var line_count: usize = 0;
+    var empty_count: usize = 0;
     while (true) {
         const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.EndOfStream => {
-                std.debug.print("      load_cdb_map: EOF after {} lines\n", .{line_count});
+                std.debug.print("      load_cdb_map: EOF after {} lines ({} empty)\n", .{ line_count, empty_count });
                 break;
             },
             else => return err,
         };
         if (line.len == 0) {
-            std.debug.print("      load_cdb_map: empty line\n", .{});
+            empty_count += 1;
+            if (empty_count <= 5) {
+                std.debug.print("      load_cdb_map: empty line #{}\n", .{empty_count});
+            }
+            if (empty_count == 100) {
+                std.debug.print("      load_cdb_map: too many empty lines (>100), aborting\n", .{});
+                return error.TooManyEmptyLines;
+            }
             continue;
         }
+        empty_count = 0;
+
+        std.debug.print("      load_cdb_map: line {} (len={})\n", .{ line_count + 1, line.len });
 
         const path = extract_path(b, line) orelse {
-            std.debug.print("      load_cdb_map: extract_path failed, len={}\n", .{line.len});
+            std.debug.print("      load_cdb_map: extract_path failed, content: '{s}'\n", .{line[0..@min(line.len, 80)]});
             continue;
         };
         const fragment = b.dupe(line);
