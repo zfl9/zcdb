@@ -202,7 +202,7 @@ pub const Instance = struct {
     }
 };
 
-/// Returns the extra C compiler flags required to emit cdb fragments. \
+/// Returns the C/C++ flags required to emit cdb fragments. \
 /// Returns null if zcdb is not enabled in this build. \
 pub fn require_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const []const u8 {
     const emit = Emit.from(b.graph.env_map.get(ENV_EMIT) orelse return null).?;
