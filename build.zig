@@ -5,7 +5,7 @@ const ENV_EMIT = "ZCDB_EMIT";
 const ENV_STAMP = "ZCDB_STAMP";
 const CDB_RAW_FILENAME = "cdb.raw";
 const CDB_JSON_FILENAME = "compile_commands.json";
-const CDB_DIR = "cdb";
+const CDB_BASE_DIR = "cdb";
 const FRAG_DIR = "frag";
 
 // ================================= API =================================
@@ -245,7 +245,7 @@ fn compute_triple(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
 fn compute_frag_path(b: *std.Build, triple: []const u8) []const u8 {
     var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
-    return b.pathJoin(&.{ cache_root, CDB_DIR, triple, FRAG_DIR });
+    return b.pathJoin(&.{ cache_root, CDB_BASE_DIR, triple, FRAG_DIR });
 }
 
 const CDBLink = struct {
@@ -531,7 +531,7 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
-    var dir = b.cache_root.handle.openDir(CDB_DIR, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = b.cache_root.handle.openDir(CDB_BASE_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
@@ -556,7 +556,7 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
         delete_files.clearRetainingCapacity();
 
         const dirty = link(b, .{
-            .cdb_dir_path = b.pathJoin(&.{ CDB_DIR, entry.name }),
+            .cdb_dir_path = b.pathJoin(&.{ CDB_BASE_DIR, entry.name }),
             .cdb_map = &cdb_map,
             .reader_buf = reader_buf,
             .delete_files = &delete_files,
@@ -620,7 +620,7 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
     //     - cdb.raw
     //     - compile_commands.json
     //     - frag/*.json
-    var dir = b.cache_root.handle.openDir(CDB_DIR, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = b.cache_root.handle.openDir(CDB_BASE_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return any_dirty, // that is ok
         else => return err,
     };
@@ -638,7 +638,7 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
         cdb_map.clearRetainingCapacity();
 
         const dirty = gc(b, .{
-            .cdb_dir_path = b.pathJoin(&.{ CDB_DIR, entry.name }),
+            .cdb_dir_path = b.pathJoin(&.{ CDB_BASE_DIR, entry.name }),
             .cdb_map = &cdb_map,
         }) catch |err| blk: {
             try step.addError("gc failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
@@ -668,7 +668,7 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
         var realpath_buf2: [std.fs.max_path_bytes]u8 = undefined;
         const build_root = b.build_root.handle.realpath(".", &realpath_buf2) catch unreachable;
 
-        const abs_target_path = b.pathJoin(&.{ cache_root, CDB_DIR, triple, CDB_JSON_FILENAME });
+        const abs_target_path = b.pathJoin(&.{ cache_root, CDB_BASE_DIR, triple, CDB_JSON_FILENAME });
         const target_path = try std.fs.path.relative(b.allocator, build_root, abs_target_path);
 
         b.build_root.handle.deleteFile(CDB_JSON_FILENAME) catch |err| switch (err) {

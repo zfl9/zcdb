@@ -4,8 +4,10 @@
 
 ### 1. 添加依赖
 
+> 具体版本见 [Tags](https://github.com/zfl9/zcdb/tags) 页面。
+
 ```bash
-zig fetch --save=zcdb https://github.com/zfl9/zcdb/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save=zcdb https://github.com/zfl9/zcdb/archive/refs/tags/v1.0.0.tar.gz
 ```
 
 ### 2. 集成到 `build.zig`
@@ -17,7 +19,7 @@ pub fn build(b: *std.Build) void {
     const zcdb_instance = zcdb.Instance.create(b, .{});
     defer zcdb_instance.finalize();
 
-    // 正常构建逻辑（installArtifact、addExecutable 等）
+    // 正常构建逻辑（addExecutable、installArtifact 等）
 }
 ```
 
@@ -55,17 +57,17 @@ pub const CreateOptions = struct {
 };
 ```
 
-### `Instance.finalize()`
+### `instance.finalize()`
 
-为所有 C/C++ 编译步骤注入 `-gen-cdb-fragment-path`，并将 CDB link step 挂载到 `install` 之前。通过 `defer` 调用。
+为所有 C/C++ 编译步骤注入 `-gen-cdb-fragment-path`。通过 `defer` 调用。
 
-### `Instance.get_gc_step() → *std.Build.Step`
+### `instance.get_gc_step() → *std.Build.Step`
 
 获取 GC step，可挂载到自定义 step 链中。
 
 ### `require_cflags(b, target) → ?[]const []const u8`
 
-获取 zcdb 正常工作所需追加的编译 flags，若未启用则返回 `null`。供 zmake 等外部构建系统集成使用：
+获取 zcdb 所需的编译 flags，若未启用则返回 `null`。供 zmake 等外部构建系统集成使用：
 
 ```zig
 if (zcdb.require_cflags(b, target)) |cflags| {
