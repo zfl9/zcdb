@@ -313,26 +313,47 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     std.debug.print("      load_cdb_map: opening {s}...\n", .{CDB_RAW_FILENAME});
 
     var file = cdb_dir.openFile(CDB_RAW_FILENAME, .{}) catch |err| switch (err) {
-        error.FileNotFound => return, // that is ok
+        error.FileNotFound => {
+            std.debug.print("      load_cdb_map: file not found\n", .{});
+            return;
+        },
         else => return err,
     };
-    defer file.close();
+    defer {
+        std.debug.print("      load_cdb_map: file closed\n", .{});
+        file.close();
+    }
+
+    std.debug.print("      load_cdb_map: file opened, allocating buffer...\n", .{});
 
     // ensure that the longest line can be buffered
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
     defer b.allocator.free(buf);
 
+    std.debug.print("      load_cdb_map: buffer allocated, creating reader...\n", .{});
+
     var reader = file.reader(buf);
+
+    std.debug.print("      load_cdb_map: reading lines...\n", .{});
 
     var line_count: usize = 0;
     while (true) {
         const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
+            error.EndOfStream => {
+                std.debug.print("      load_cdb_map: EOF after {} lines\n", .{line_count});
+                break;
+            },
             else => return err,
         };
-        if (line.len == 0) continue;
+        if (line.len == 0) {
+            std.debug.print("      load_cdb_map: empty line\n", .{});
+            continue;
+        }
 
-        const path = extract_path(b, line) orelse continue;
+        const path = extract_path(b, line) orelse {
+            std.debug.print("      load_cdb_map: extract_path failed, len={}\n", .{line.len});
+            continue;
+        };
         const fragment = b.dupe(line);
         try cdb_map.put(path, fragment);
         line_count += 1;
