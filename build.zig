@@ -175,30 +175,19 @@ pub const Instance = struct {
     }
 
     fn inject_cflags(self: *Instance, flags: *[]const []const u8, frag_path: []const u8) void {
-        const b = self.b;
-
-        const old_flags = flags.*;
-        var new_flags: [][]const u8 = undefined;
-
         switch (self.emit) {
-            .yes => {
-                new_flags = b.allocator.alloc([]const u8, old_flags.len + 2) catch unreachable;
+            .yes, .force => {
+                const old_flags = flags.*;
+                const extra_slots = if (self.emit == .force) 3 else 2;
+                const new_flags = self.b.allocator.alloc([]const u8, old_flags.len + extra_slots) catch unreachable;
                 @memcpy(new_flags[0..old_flags.len], old_flags);
                 new_flags[old_flags.len] = "-gen-cdb-fragment-path";
                 new_flags[old_flags.len + 1] = frag_path;
-            },
-            .force => {
-                // inject force stamp to invalidate zig compilation cache
-                new_flags = b.allocator.alloc([]const u8, old_flags.len + 3) catch unreachable;
-                @memcpy(new_flags[0..old_flags.len], old_flags);
-                new_flags[old_flags.len] = "-gen-cdb-fragment-path";
-                new_flags[old_flags.len + 1] = frag_path;
-                new_flags[old_flags.len + 2] = self.force_cflag.?;
+                if (self.emit == .force) new_flags[old_flags.len + 2] = self.force_cflag.?;
+                flags.* = new_flags;
             },
             .no => unreachable,
         }
-
-        flags.* = new_flags;
     }
 };
 
@@ -206,22 +195,17 @@ pub const Instance = struct {
 /// Returns null if zcdb is not enabled in this build. \
 pub fn require_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const []const u8 {
     const emit = Emit.from(b.graph.env_map.get(ENV_EMIT) orelse return null).?;
-    return switch (emit) {
-        .yes => r: {
-            const cflags = b.allocator.alloc([]const u8, 2) catch unreachable;
+    switch (emit) {
+        .yes, .force => {
+            const extra_slots = if (emit == .force) 3 else 2;
+            const cflags = b.allocator.alloc([]const u8, extra_slots) catch unreachable;
             cflags[0] = "-gen-cdb-fragment-path";
             cflags[1] = compute_frag_path(b, compute_triple(b, target));
-            break :r cflags;
+            if (emit == .force) cflags[2] = compute_force_cflag(b, null);
+            return cflags;
         },
-        .force => r: {
-            const cflags = b.allocator.alloc([]const u8, 3) catch unreachable;
-            cflags[0] = "-gen-cdb-fragment-path";
-            cflags[1] = compute_frag_path(b, compute_triple(b, target));
-            cflags[2] = compute_force_cflag(b, null);
-            break :r cflags;
-        },
-        .no => null,
-    };
+        .no => return null,
+    }
 }
 
 // ================================= private =================================
@@ -245,7 +229,9 @@ fn compute_triple(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
 fn compute_frag_path(b: *std.Build, triple: []const u8) []const u8 {
     var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
-    return b.pathJoin(&.{ cache_root, CDB_BASE_DIR, triple, FRAG_DIR });
+    const path = b.pathJoin(&.{ cache_root, CDB_BASE_DIR, triple, FRAG_DIR });
+    b.cache_root.handle.makePath(std.fs.path.dirname(path).?) catch unreachable;
+    return path;
 }
 
 const CDBLink = struct {
@@ -370,7 +356,7 @@ fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringH
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
     defer b.allocator.free(buf);
 
-    var writer = file.writer(&buf);
+    var writer = file.writer(buf);
 
     var it = cdb_map.valueIterator();
     while (it.next()) |p_fragment| {
@@ -402,7 +388,7 @@ fn save_cdb_json(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.String
     const buf = try b.allocator.alloc(u8, 1024 * 1024);
     defer b.allocator.free(buf);
 
-    var writer = file.writer(&buf);
+    var writer = file.writer(buf);
 
     if (cdb_map.count() == 0) {
         try writer.interface.writeAll("[]\n");
@@ -465,7 +451,7 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
     const delete_files = ctx.delete_files;
 
     // check for new fragments
-    const frag_dir = cdb_dir.openDir(FRAG_DIR, .{ .iterate = true }) catch |err| switch (err) {
+    var frag_dir = cdb_dir.openDir(FRAG_DIR, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return dirty, // that is ok
         else => return err,
     };
