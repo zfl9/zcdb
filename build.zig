@@ -36,7 +36,7 @@ pub const Emit = enum {
 /// // usage
 /// const zcdb = @import("zcdb");
 /// pub fn build(b: *std.Build) void {
-///     const zcdb_instance = zcdb.Instance.create(b, .{});
+///     const zcdb_instance = zcdb.Instance.create(b, .{.target = target});
 ///     defer zcdb_instance.finalize();
 ///     // the build script logic ...
 /// }
@@ -46,14 +46,16 @@ pub const Instance = struct {
     emit: Emit,
     force_cflag: ?[]const u8,
     gc_step: *std.Build.Step,
+    cdb_link: *CDBLink,
     visited: std.AutoHashMap(*std.Build.Step, void),
-    cdb_link: ?*CDBLink = null,
 
     pub fn get_gc_step(self: *const Instance) *std.Build.Step {
         return self.gc_step;
     }
 
     pub const CreateOptions = struct {
+        target: std.Build.ResolvedTarget,
+
         /// cli option name (zig build -Dcdb=yes)
         emit_option_name: []const u8 = "cdb",
 
@@ -92,6 +94,7 @@ pub const Instance = struct {
             .emit = emit,
             .force_cflag = force_cflag,
             .gc_step = gc_step,
+            .cdb_link = CDBLink.create(b, options.target),
             .visited = .init(b.allocator),
         };
         return self;
@@ -105,21 +108,16 @@ pub const Instance = struct {
                 const b = self.b;
                 assert(is_root_pkg(b));
 
-                // collect all cdb fragments
-                const cdb_link = CDBLink.create(b);
-                assert(self.cdb_link == null);
-                self.cdb_link = cdb_link;
-
                 for (b.getInstallStep().dependencies.items) |dep_step| {
                     // inject the cdb flags into all compile steps
                     self.traverse_step(dep_step);
 
                     // link cdb fragments after all compile steps
-                    cdb_link.step.dependOn(dep_step);
+                    self.cdb_link.step.dependOn(dep_step);
                 }
 
                 // reference it in the install step
-                b.getInstallStep().dependOn(&cdb_link.step);
+                b.getInstallStep().dependOn(&self.cdb_link.step);
             },
 
             .no => {},
@@ -148,11 +146,7 @@ pub const Instance = struct {
 
         // the root module's target is always available
         const target = root_module.resolved_target orelse return;
-        const triple = compute_triple(b, target);
-        const frag_path = compute_frag_path(b, triple);
-
-        // record the dir name for the cdb link step
-        self.cdb_link.?.record_triple(triple);
+        const frag_path = compute_frag_path(b, target);
 
         // traverse all modules in the graph (root + import_table)
         const mod_graph = root_module.getGraph();
@@ -200,7 +194,7 @@ pub fn require_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const 
             const extra_slots = if (emit == .force) 3 else 2;
             const cflags = b.allocator.alloc([]const u8, extra_slots) catch unreachable;
             cflags[0] = "-gen-cdb-fragment-path";
-            cflags[1] = compute_frag_path(b, compute_triple(b, target));
+            cflags[1] = compute_frag_path(b, target);
             if (emit == .force) cflags[2] = compute_force_cflag(b, null);
             return cflags;
         },
@@ -226,21 +220,22 @@ fn compute_triple(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     return b.fmt("{s}@{s}", .{ triple, cpu });
 }
 
-fn compute_frag_path(b: *std.Build, triple: []const u8) []const u8 {
+fn compute_frag_path(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
+    const triple = compute_triple(b, target);
     const path = b.pathJoin(&.{ cache_root, CDB_BASE_DIR, triple, FRAG_DIR });
-    b.cache_root.handle.makePath(std.fs.path.dirname(path).?) catch unreachable;
+    b.cache_root.handle.makePath(path) catch unreachable;
     return path;
 }
 
 const CDBLink = struct {
     step: std.Build.Step,
-    triple: ?[]const u8,
+    triple: []const u8,
 
     pub const base_id: std.Build.Step.Id = .custom;
 
-    pub fn create(b: *std.Build) *CDBLink {
+    pub fn create(b: *std.Build, target: std.Build.ResolvedTarget) *CDBLink {
         const self = b.allocator.create(CDBLink) catch @panic("OOM");
         self.* = .{
             .step = .init(.{
@@ -249,14 +244,9 @@ const CDBLink = struct {
                 .owner = b,
                 .makeFn = make_link,
             }),
-            .triple = null,
+            .triple = compute_triple(b, target),
         };
         return self;
-    }
-
-    pub fn record_triple(self: *CDBLink, triple: []const u8) void {
-        if (self.triple != null) return;
-        self.triple = self.step.owner.dupe(triple);
     }
 };
 
@@ -647,22 +637,20 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     if (!dirty) step.result_cached = true;
 
     // $build_root/compile_commands.json -> $cache_root/cdb/$triple/compile_commands.json
-    if (self.triple) |triple| {
-        var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
+    var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_root = b.cache_root.handle.realpath(".", &realpath_buf) catch unreachable;
 
-        var realpath_buf2: [std.fs.max_path_bytes]u8 = undefined;
-        const build_root = b.build_root.handle.realpath(".", &realpath_buf2) catch unreachable;
+    var realpath_buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const build_root = b.build_root.handle.realpath(".", &realpath_buf2) catch unreachable;
 
-        const abs_target_path = b.pathJoin(&.{ cache_root, CDB_BASE_DIR, triple, CDB_JSON_FILENAME });
-        const target_path = try std.fs.path.relative(b.allocator, build_root, abs_target_path);
+    const abs_target_path = b.pathJoin(&.{ cache_root, CDB_BASE_DIR, self.triple, CDB_JSON_FILENAME });
+    const target_path = try std.fs.path.relative(b.allocator, build_root, abs_target_path);
 
-        b.build_root.handle.deleteFile(CDB_JSON_FILENAME) catch |err| switch (err) {
-            error.FileNotFound => {}, // that's fine
-            else => return err,
-        };
-        try b.build_root.handle.symLink(target_path, CDB_JSON_FILENAME, .{});
-    }
+    b.build_root.handle.deleteFile(CDB_JSON_FILENAME) catch |err| switch (err) {
+        error.FileNotFound => {}, // that's fine
+        else => return err,
+    };
+    try b.build_root.handle.symLink(target_path, CDB_JSON_FILENAME, .{});
 }
 
 fn make_gc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
