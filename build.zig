@@ -311,7 +311,7 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     }
 
     var file = cdb_dir.openFile(CDB_RAW_FILENAME, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return, // that is ok
         else => return err,
     };
     defer file.close();
@@ -323,11 +323,10 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
     var reader = file.reader(buf);
 
     while (true) {
-        const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => return err,
-            else => |e| return e,
-        } orelse break;
-
+        const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
         if (line.len == 0) continue;
 
         const path = extract_path(b, line) orelse continue;
@@ -340,7 +339,6 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
 fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringHashMap([]const u8)) !void {
     const filename = CDB_RAW_FILENAME;
     const filename_tmp = filename ++ ".tmp";
-
 
     const file = try cdb_dir.createFile(filename_tmp, .{});
     defer file.close();
@@ -361,7 +359,6 @@ fn save_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *const std.StringH
 
     // atomic rename
     try cdb_dir.rename(filename_tmp, filename);
-
 }
 
 /// test if $cdb_dir/compile_commands.json exists
@@ -423,7 +420,6 @@ const LinkCtx = struct {
 fn link(b: *std.Build, ctx: LinkCtx) !bool {
     var dirty = false;
 
-
     // - $cdb_dir/
     //   - cdb.raw
     //   - compile_commands.json
@@ -456,12 +452,11 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
-
         var file = frag_dir.openFile(entry.name, .{}) catch continue;
         defer file.close();
 
         var reader = file.reader(reader_buf);
-        var fragment: []const u8 = reader.interface.takeDelimiter('\n') catch continue orelse continue;
+        var fragment: []const u8 = reader.interface.takeDelimiterExclusive('\n') catch continue;
 
         // get the key and value (memory is owned)
         const path = extract_path(b, fragment) orelse continue;
@@ -477,7 +472,6 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
 
         dirty = true;
     }
-
 
     if (dirty)
         try save_cdb_map(b, &cdb_dir, cdb_map);
@@ -508,7 +502,6 @@ fn is_cdb_dir(dirname: []const u8) bool {
 fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
     var any_dirty = false;
 
-
     // - $cache_root/cdb/
     //   - triple@cpu/
     //     - cdb.raw
@@ -534,7 +527,6 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
         if (entry.kind != .directory) continue;
         if (!is_cdb_dir(entry.name)) continue;
 
-
         // reset the container
         cdb_map.clearRetainingCapacity();
         delete_files.clearRetainingCapacity();
@@ -548,7 +540,6 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
             try step.addError("link failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
             break :blk true;
         };
-
 
         if (dirty) any_dirty = true;
     }
@@ -642,10 +633,8 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     const b = step.owner;
     const self: *CDBLink = @fieldParentPtr("step", step);
 
-
     const dirty = try link_all(b, step);
     if (!dirty) step.result_cached = true;
-
 
     // $build_root/compile_commands.json -> $cache_root/cdb/$triple/compile_commands.json
     var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -662,7 +651,6 @@ fn make_link(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
         else => return err,
     };
     try b.build_root.handle.symLink(target_path, CDB_JSON_FILENAME, .{});
-
 }
 
 fn make_gc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
