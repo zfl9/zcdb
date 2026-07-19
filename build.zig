@@ -498,7 +498,7 @@ fn link(b: *std.Build, ctx: LinkCtx) !bool {
         defer file.close();
 
         var reader = file.reader(reader_buf);
-        var fragment: []const u8 = reader.interface.takeDelimiterExclusive('\n') catch continue;
+        var fragment: []const u8 = reader.interface.takeDelimiter('\n') catch continue orelse continue;
 
         // get the key and value (memory is owned)
         const path = extract_path(b, fragment) orelse continue;
