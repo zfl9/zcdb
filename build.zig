@@ -77,10 +77,10 @@ pub const Instance = struct {
         }
 
         const force_cflag = switch (emit) {
-            .force => cflag: {
+            .force => r: {
                 const stamp = b.fmt("{d}", .{std.time.milliTimestamp()});
                 b.graph.env_map.put(ENV_STAMP, stamp) catch unreachable;
-                break :cflag compute_force_cflag(b, stamp);
+                break :r compute_force_cflag(b, stamp);
             },
             else => null,
         };
@@ -322,13 +322,8 @@ fn load_cdb_map(b: *std.Build, cdb_dir: *std.fs.Dir, cdb_map: *std.StringHashMap
 
     var reader = file.reader(buf);
 
-    while (true) {
-        const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => return err,
-            else => |e| return e,
-        } orelse break;
+    while (try reader.interface.takeDelimiter('\n')) |line| {
         if (line.len == 0) continue;
-
         const path = extract_path(b, line) orelse continue;
         const fragment = b.dupe(line);
         try cdb_map.put(path, fragment);
@@ -536,9 +531,9 @@ fn link_all(b: *std.Build, step: *std.Build.Step) !bool {
             .cdb_map = &cdb_map,
             .reader_buf = reader_buf,
             .delete_files = &delete_files,
-        }) catch |err| blk: {
+        }) catch |err| r: {
             try step.addError("link failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
-            break :blk true;
+            break :r true;
         };
 
         if (dirty) any_dirty = true;
@@ -616,9 +611,9 @@ fn gc_all(b: *std.Build, step: *std.Build.Step) !bool {
         const dirty = gc(b, .{
             .cdb_dir_path = b.pathJoin(&.{ CDB_BASE_DIR, entry.name }),
             .cdb_map = &cdb_map,
-        }) catch |err| blk: {
+        }) catch |err| r: {
             try step.addError("gc failed for target '{s}': {s}", .{ entry.name, @errorName(err) });
-            break :blk true;
+            break :r true;
         };
 
         if (dirty) any_dirty = true;
