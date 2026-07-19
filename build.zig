@@ -9,6 +9,25 @@ pub fn build(_: *std.Build) void {}
 const ENV_EMIT = "ZCDB_EMIT";
 const ENV_STAMP = "ZCDB_STAMP";
 
+pub const Emit = enum {
+    /// yes, emit compile_commands.json
+    yes,
+    /// force re-emit compile_commands.json
+    force,
+    /// no, do not emit compile_commands.json
+    no,
+
+    pub fn from(name: []const u8) ?Emit {
+        if (std.mem.eql(u8, name, "yes"))
+            return .yes;
+        if (std.mem.eql(u8, name, "force"))
+            return .force;
+        if (std.mem.eql(u8, name, "no"))
+            return .no;
+        return null;
+    }
+};
+
 /// ```zig
 /// // usage
 /// const zcdb = @import("zcdb");
@@ -25,20 +44,6 @@ pub const Instance = struct {
     gc_step: *std.Build.Step,
     visited: std.AutoHashMap(*std.Build.Step, void),
     cdb_link: ?*CDBLink = null,
-
-    /// -Dcdb=yes -Dcdb=no -Dcdb=force
-    pub const Emit = enum {
-        /// yes, emit compile_commands.json
-        yes,
-        /// force re-emit compile_commands.json
-        force,
-        /// no, do not emit compile_commands.json
-        no,
-    };
-
-    fn is_root_pkg(b: *std.Build) bool {
-        return b.pkg_hash.len == 0;
-    }
 
     pub fn get_gc_step(self: *const Instance) *std.Build.Step {
         return self.gc_step;
@@ -138,9 +143,9 @@ pub const Instance = struct {
         const root_module = compile.root_module;
 
         // the root module's target is always available
-        const target = (root_module.resolved_target orelse return).result;
+        const target = root_module.resolved_target orelse return;
         const dir_name = compute_dir_name(b, target);
-        const cdb_path = compute_frag_path(b, dir_name);
+        const frag_path = compute_frag_path(b, dir_name);
 
         // record the dir name for the cdb link step
         self.cdb_link.?.record_dir_name(dir_name);
@@ -151,10 +156,10 @@ pub const Instance = struct {
             for (mod.link_objects.items) |*link_object| {
                 switch (link_object.*) {
                     .c_source_file => |csf| {
-                        self.inject_cflag(&csf.flags, cdb_path);
+                        self.inject_cflag(&csf.flags, frag_path);
                     },
                     .c_source_files => |csf| {
-                        self.inject_cflag(&csf.flags, cdb_path);
+                        self.inject_cflag(&csf.flags, frag_path);
                     },
                     .other_step => |other| {
                         self.traverse_step(&other.step);
@@ -196,17 +201,30 @@ pub const Instance = struct {
 /// Returns the extra C compiler flags needed to emit cdb fragments. \
 /// Returns null if zcdb is not enabled in this build. \
 pub fn get_cflags(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const []const u8 {
-    const emit = b.graph.env_map.get("ZCDB_EMIT") orelse return null;
-    const emit_force = std.mem.eql(u8, emit, "force");
-    const frag_path = compute_frag_path(b, compute_dir_name(b, target.result));
-    const cflags = b.allocator.alloc([]const u8, if (emit_force) 3 else 2) catch unreachable;
-    cflags[0] = "-gen-cdb-fragment-path";
-    cflags[1] = frag_path;
-    if (emit_force) cflags[2] = compute_force_cflag(b, null);
-    return cflags;
+    const emit = Emit.from(b.graph.env_map.get("ZCDB_EMIT") orelse return null).?;
+    return switch (emit) {
+        .yes => r: {
+            const cflags = b.allocator.alloc([]const u8, 2) catch unreachable;
+            cflags[0] = "-gen-cdb-fragment-path";
+            cflags[1] = compute_frag_path(b, compute_dir_name(b, target));
+            break :r cflags;
+        },
+        .force => r: {
+            const cflags = b.allocator.alloc([]const u8, 3) catch unreachable;
+            cflags[0] = "-gen-cdb-fragment-path";
+            cflags[1] = compute_frag_path(b, compute_dir_name(b, target));
+            cflags[2] = compute_force_cflag(b, null);
+            break :r cflags;
+        },
+        .no => null,
+    };
 }
 
 // ================================= private =================================
+
+fn is_root_pkg(b: *const std.Build) bool {
+    return b.pkg_hash.len == 0;
+}
 
 /// `in_stamp` null means read from env_map
 fn compute_force_cflag(b: *std.Build, in_stamp: ?[]const u8) []const u8 {
@@ -214,9 +232,9 @@ fn compute_force_cflag(b: *std.Build, in_stamp: ?[]const u8) []const u8 {
     return b.fmt("-DZCDB__FORCE__={s}", .{stamp});
 }
 
-fn compute_dir_name(b: *std.Build, target: std.Target) []const u8 {
-    const triple = target.zigTriple(b.allocator) catch unreachable;
-    const cpu = std.zig.serializeCpuAlloc(b.allocator, target.cpu) catch unreachable;
+fn compute_dir_name(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
+    const triple = target.result.zigTriple(b.allocator) catch unreachable;
+    const cpu = std.zig.serializeCpuAlloc(b.allocator, target.result.cpu) catch unreachable;
     return b.fmt("{s}@{s}", .{ triple, cpu });
 }
 
